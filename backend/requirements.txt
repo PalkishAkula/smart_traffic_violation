@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+motor
+pymongo
+python-dotenv
+python-multipart
+python-socketio
+python-jose[cryptography]
+cloudinary
