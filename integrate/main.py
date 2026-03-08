@@ -46,7 +46,8 @@ import numpy as np
 from ultralytics import YOLO
 import easyocr
 
-from utils           import is_rider_on_bike, get_iou
+from utils           import (is_rider_on_bike, get_iou, identify_pillion,
+                              assign_head_detections)
 from helmet_logic    import check_helmet_violation
 from triple_riding   import check_triple_riding
 from co_riding       import check_co_riding
@@ -127,7 +128,9 @@ CLR_PILLION = (180,   0, 255)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _persons_on_bike(persons: list, bike_box: tuple) -> list:
-    return [p for p in persons if is_rider_on_bike(p[:4], bike_box)]
+    return [p for p in persons
+            if (get_iou(p[:4], bike_box[:4]) >= ASSOC_IOU_THRESH
+                or is_rider_on_bike(p[:4], bike_box))]
 
 
 def _detections_on_bike(dets: list, bike_box: tuple) -> list:
@@ -202,7 +205,9 @@ def draw_frame(frame, tracked, persons, helmets, no_helmets, plates, memory):
                 label, col = "!! CO-RIDER NO HELMET", CLR_PILLION
             _txt(frame, label, (lb[0], y_top), col, scale=0.60, thick=2)
             y_top -= 22
-            plate_str = rec.plate_text or "PLATE UNREAD"
+            
+        if viols:
+            plate_str = viols[0].plate_text or "PLATE UNREAD"
             _txt(frame, f"Plate: {plate_str}",
                  (lb[0], lb[3] + 20), CLR_PLATE, scale=0.55)
 
@@ -387,17 +392,79 @@ def _process_inference_frame(frame, coco_model, helmet_model, plate_model,
                 if violation_callback is not None:
                     violation_callback(rec, bike_box)
 
-        # Triple riding takes precedence
-        violated, _ = check_triple_riding(persons_on, helmets_on, no_helmets_on)
-        _check_and_log(V_TRIPLE, violated)
+        # ── Per-person helmet assignment ──────────────────────────────────────
+        # Assign each helmet / no-helmet detection to the person whose HEAD
+        # REGION (top 40 % of body box) best matches it.
+        #
+        # p_helmets[i]    → helmet detections that belong to person i
+        # p_no_helmets[i] → no-helmet detections that belong to person i
+        #
+        # This replaces the old approach of comparing full-body person boxes
+        # (large) against head-sized helmet boxes (small), which produced
+        # near-zero IoU and caused "absence of helmet = violation" logic to
+        # fire incorrectly (bugs 2.2 – 2.4 and all triple equivalents).
+        p_helmets, p_no_helmets = assign_head_detections(
+            persons_on, helmets_on, no_helmets_on)
 
-        violated, _ = check_co_riding(persons_on, helmets_on, no_helmets_on, bike_box)
-        _check_and_log(V_CO_RIDING, violated)
+        # Identify driver: person whose x-centre is CLOSEST to the bike's
+        # horizontal centre.  All other persons are co-riders / pillions.
+        if len(persons_on) >= 2:
+            bike_cx    = (float(bike_box[0]) + float(bike_box[2])) / 2.0
+            driver_idx = min(
+                range(len(persons_on)),
+                key=lambda i: abs(
+                    (persons_on[i][0] + persons_on[i][2]) / 2.0 - bike_cx)
+            )
+            co_indices = [i for i in range(len(persons_on)) if i != driver_idx]
+            driver_nh  = p_no_helmets[driver_idx]   # detections on driver's head
+        elif len(persons_on) == 1:
+            driver_idx = 0
+            co_indices = []
+            driver_nh  = p_no_helmets[0]
+        else:                   # 0 COCO persons (triple detected via head count)
+            driver_idx = None
+            co_indices = []
+            driver_nh  = []
 
-        violated, _ = check_helmet_violation(no_helmets_on, helmets_on)
-        _check_and_log(V_NO_HELMET, violated)
+        # ── TRIPLE RIDING ─────────────────────────────────────────────────────
+        triple_violated, _ = check_triple_riding(persons_on, helmets_on, no_helmets_on)
+        _check_and_log(V_TRIPLE, triple_violated)
 
-        # OCR retries
+        # ── CO_RIDING_NO_HELMET ───────────────────────────────────────────────
+        # For triple riding the co-riding check differs: any of the (2+) co-rider
+        # persons with a positive no-helmet detection triggers the violation.
+        # For the 2-person case we delegate to check_co_riding (which has its
+        # own pillion-identification and head-detection guard logic).
+        if triple_violated:
+            if co_indices:
+                # A co-rider has a positive no-helmet detection → violation
+                triple_co_nh = any(p_no_helmets[i] for i in co_indices)
+            else:
+                # COCO missed all co-rider bodies but triple was confirmed via
+                # head count.  Fall back: 2+ no-helmets on a 3+ person bike
+                # means at least one co-rider has no helmet.
+                triple_co_nh = len(no_helmets_on) > 1
+            _check_and_log(V_CO_RIDING, triple_co_nh)
+        else:
+            co_violated, _ = check_co_riding(
+                persons_on, helmets_on, no_helmets_on, bike_box)
+            _check_and_log(V_CO_RIDING, co_violated)
+
+        # ── NO_HELMET ─────────────────────────────────────────────────────────
+        # Fires ONLY when the DRIVER's head has a positive no-helmet detection.
+        # Co-rider no-helmets are covered by CO_RIDING_NO_HELMET above and
+        # must not bleed into this check.
+        #
+        # If COCO detected 0 persons and CO_RIDING was already logged, the
+        # only no-helmet detection visible belongs to the co-rider → suppress.
+        if driver_idx is None and memory.has(tid, V_CO_RIDING):
+            driver_nh = []   # no-helmet belongs to co-rider already logged
+
+        nh_violated, _ = check_helmet_violation(driver_nh, helmets_on)
+        _check_and_log(V_NO_HELMET, nh_violated)
+
+        # OCR retries – only retry violations that are actually logged for this track
+        # (respects the hierarchy: a track has at most one violation type active)
         for vtype in (V_TRIPLE, V_CO_RIDING, V_NO_HELMET):
             if memory.needs_plate_retry(tid, vtype, frame_num=frame_num,
                                         retry_frame_gap=PLATE_RETRY_FRAME_GAP):

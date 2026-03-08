@@ -62,7 +62,12 @@ STATE_RANK = {
     'LD':1,  'AN':1,
 }
 
-IND_PREFIXES = ['IND', 'IMD', 'IHD', 'INC', 'IN', 'ND', 'ID', 'IM']
+IND_PREFIXES = [
+    'IND', 'IMD', 'IHD', 'INC', 'IN', 'ND', 'ID', 'IM',  # original
+    'PL', 'PLND', 'PLIN', 'PLN',   # "PLATE" border text
+    'BH', 'GOI', 'GI',             # Bharat / Govt. of India watermarks
+    'VH', 'VEH', 'MV',             # "VEHICLE" abbreviations on some plates
+]
 
 DIGIT_TO_LETTER = {
     '0':'O','1':'I','2':'Z','3':'E','4':'A',
@@ -160,7 +165,14 @@ def _try_fix_all(s, series_len, preferred_states=None):
         if PLATE_PATTERN.match(plate):
             candidates.append(plate)
     if not candidates: return None
-    candidates.sort(key=lambda p: _rank_state(p[:2], preferred_states), reverse=True)
+    # Give the OCR-read state code strong preference over SIMILAR-map
+    # alternatives so that a correctly-read state (e.g. 'HR') is not
+    # replaced by a higher-population-ranked state (e.g. 'MP').
+    ocr_state = fixed[:2]
+    effective_preferred = list(preferred_states or [])
+    if ocr_state in VALID_STATE_CODES and ocr_state not in effective_preferred:
+        effective_preferred.append(ocr_state)
+    candidates.sort(key=lambda p: _rank_state(p[:2], effective_preferred), reverse=True)
     return candidates[0]
 
 def _try_fix_with_digit_subs(s, series_len, preferred_states=None):
@@ -171,13 +183,18 @@ def _try_fix_with_digit_subs(s, series_len, preferred_states=None):
     d0, d1 = fixed[2], fixed[3]
     alts0 = [d0] + [a for a in DIGIT_SIMILAR.get(d0, []) if a.isdigit()]
     alts1 = [d1] + [a for a in DIGIT_SIMILAR.get(d1, []) if a.isdigit()]
+    # Give the OCR-read state strong preference (same logic as _try_fix_all).
+    ocr_state = fixed[:2]
+    effective_preferred = list(preferred_states or [])
+    if ocr_state in VALID_STATE_CODES and ocr_state not in effective_preferred:
+        effective_preferred.append(ocr_state)
     best, best_rank = None, -1
     for a0, a1 in iter_product(alts0, alts1):
         variant = fixed[:2] + a0 + a1 + fixed[4:]
         for cs in _all_valid_states_from(variant[:2]):
             plate = cs + variant[2:]
             if PLATE_PATTERN.match(plate):
-                rank = _rank_state(cs, preferred_states)
+                rank = _rank_state(cs, effective_preferred)
                 if rank > best_rank:
                     best_rank = rank;  best = plate
     return best
@@ -245,19 +262,25 @@ def correct_indian_plate(raw_text, preferred_states=None):
             if r: return r
         r = _recover_dropped_char(stripped, ps)
         if r: return r
-    # ── Guard: if the raw text is longer than the longest valid Indian plate
-    # (XX00XXX0000 = 11 chars), do NOT use sliding-window / dropped-char
-    # recovery.  Those routines work by extracting a *shorter* substring and
-    # can silently discard valid characters – e.g. converting '12' in the
-    # series position to 'I2' via DIGIT_TO_LETTER['1']='I'.
-    # Instead, return the cleaned text so the original OCR reading is preserved.
-    MAX_PLATE_LEN = 11
-    if len(text) > MAX_PLATE_LEN:
+    # ── Guard: if text is much longer than the longest valid Indian plate ──────
+    # A valid plate is at most XX00XXX0000 = 11 chars.
+    # OCR commonly prepends 2-4 extra chars from plate border printing
+    # (e.g. "PL", "IND", "GOI") giving strings 12-15 chars long.
+    # We MUST still run sliding-window on these to extract the real plate.
+    #
+    # Old guard was MAX_PLATE_LEN = 11  →  blocked sliding window for 12+ char
+    # strings  →  OCR returned raw garbled text  →  PLATE UNREAD.
+    #
+    # Fix: raise the sliding-window limit to 15.  Strings longer than 15 are
+    # genuine multi-region noise (two separate texts merged by EasyOCR) and
+    # should be returned as-is rather than risk wrong extractions.
+    MAX_SLIDING_LEN = 15   # was 11 – too restrictive
+    if len(text) > MAX_SLIDING_LEN:
         return text
 
     r = _sliding_window_extract(text, ps)
     if r: return r
-    if 8 <= len(text) <= MAX_PLATE_LEN:
+    if 8 <= len(text) <= MAX_SLIDING_LEN:
         r = _recover_dropped_char(text, ps)
         if r: return r
     return text
@@ -286,7 +309,17 @@ def _sort_ocr_results(results, line_height_px=35):
 
 
 def _preprocess_plate(crop):
-    """7 preprocessed variants for multi-pass OCR (all 3× upscaled)."""
+    """
+    Preprocessed image variants for multi-pass OCR.
+
+    Base: 7 variants at 3× upscale.
+    Extra: 3 additional variants at 4× upscale when the crop is small
+           (< 120 px wide).  Motorcycle rear plates are often tiny in the
+           frame; the extra resolution helps EasyOCR resolve individual chars.
+    """
+    h_crop, w_crop = crop.shape[:2]
+
+    # ── 3× variants (always generated) ───────────────────────────────────────
     up       = cv2.resize(crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
     gray     = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
     denoised = cv2.bilateralFilter(gray, 11, 17, 17)
@@ -297,7 +330,19 @@ def _preprocess_plate(crop):
     kernel    = np.array([[0,-1,0],[-1,5,-1],[0,-1,0]])
     sharpened = cv2.filter2D(denoised, -1, kernel)
     clahe_eq  = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4,4)).apply(denoised)
-    return [gray, denoised, otsu, otsu_inv, adaptive, sharpened, clahe_eq]
+    variants  = [gray, denoised, otsu, otsu_inv, adaptive, sharpened, clahe_eq]
+
+    # ── 4× extra variants for small crops ────────────────────────────────────
+    if w_crop < 120:
+        up4    = cv2.resize(crop, None, fx=4, fy=4,
+                            interpolation=cv2.INTER_LANCZOS4)
+        g4     = cv2.cvtColor(up4, cv2.COLOR_BGR2GRAY)
+        dn4    = cv2.bilateralFilter(g4, 11, 17, 17)
+        _, ot4 = cv2.threshold(dn4, 0, 255,
+                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        variants.extend([g4, dn4, ot4])
+
+    return variants
 
 
 def _plate_length_bonus(s):

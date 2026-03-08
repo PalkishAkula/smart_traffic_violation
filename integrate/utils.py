@@ -111,3 +111,101 @@ def identify_pillion(persons_on_bike, bike_box):
     bike_cx = (bx1 + bx2) / 2.0
     return max(persons_on_bike,
                key=lambda p: abs((p[0]+p[2])/2.0 - bike_cx))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Per-person helmet assignment
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Fraction of a person's bounding box (from the top) treated as the head region.
+# 0.40 → top 40 % of the body box, which reliably covers the head/helmet for
+# both seated and standing poses regardless of camera distance.
+HEAD_FRAC = 0.40
+
+# Minimum IoU between a helmet/no-helmet detection box and a person's head
+# region to consider them a match.  Kept deliberately low (0.05) because
+# head-sized detection boxes are much smaller than full-body person boxes,
+# so their IoU with even the restricted "head region" is naturally small.
+HEAD_DET_IOU = 0.05
+
+
+def get_head_region(person_box, head_frac=HEAD_FRAC):
+    """
+    Return the head region of a person box: the top ``head_frac`` of the
+    body bounding box.
+
+    This region is used to match helmet / no-helmet detections to the
+    correct person — detections whose centre falls in this region belong
+    to this rider.
+
+    Parameters
+    ----------
+    person_box : (x1, y1, x2, y2[, conf])
+    head_frac  : fraction of box height counted as the head (default 0.40)
+
+    Returns
+    -------
+    (x1, y1, x2, head_y2) — a tighter box covering only the head/shoulders
+    """
+    x1, y1, x2, y2 = [float(v) for v in person_box[:4]]
+    return (x1, y1, x2, y1 + (y2 - y1) * head_frac)
+
+
+def assign_head_detections(persons, helmets, no_helmets):
+    """
+    Assign each helmet / no-helmet detection to the person whose HEAD REGION
+    has the highest IoU with that detection.
+
+    This is the single authoritative function that decides which detections
+    belong to the driver and which belong to the pillion / co-riders.  Using
+    HEAD REGIONS (top 40 % of body) instead of full body boxes prevents a
+    co-rider's helmet detection from being attributed to the driver (or vice
+    versa) when the two person boxes overlap.
+
+    Key design decision — only POSITIVE detections count:
+        If a person has a no-helmet detection on their head → they are
+        violating.  The ABSENCE of a helmet detection is NOT used as
+        evidence of a violation.  This fixes the root cause of cases 2.3
+        and 2.4 (CO_RIDING firing when pillion has a helmet).
+
+    Parameters
+    ----------
+    persons    : list of (x1,y1,x2,y2,conf) COCO person boxes on this bike
+    helmets    : list of (x1,y1,x2,y2,conf) helmet detections on this bike
+    no_helmets : list of (x1,y1,x2,y2,conf) no-helmet detections on this bike
+
+    Returns
+    -------
+    p_helmets    : list[list]
+        p_helmets[i] = list of helmet detections assigned to person i
+    p_no_helmets : list[list]
+        p_no_helmets[i] = list of no-helmet detections assigned to person i
+
+    Usage
+    -----
+    p_helmets, p_no_helmets = assign_head_detections(persons, helmets, no_helmets)
+    driver_has_no_helmet = bool(p_no_helmets[driver_idx])
+    pillion_has_no_helmet = bool(p_no_helmets[pillion_idx])
+    """
+    n = len(persons)
+    p_helmets    = [[] for _ in range(n)]
+    p_no_helmets = [[] for _ in range(n)]
+
+    if n == 0:
+        return p_helmets, p_no_helmets
+
+    heads = [get_head_region(p) for p in persons]
+
+    for h in helmets:
+        ious = [get_iou(hr, h[:4]) for hr in heads]
+        best = max(range(n), key=lambda i: ious[i])
+        if ious[best] >= HEAD_DET_IOU:
+            p_helmets[best].append(h)
+
+    for nh in no_helmets:
+        ious = [get_iou(hr, nh[:4]) for hr in heads]
+        best = max(range(n), key=lambda i: ious[i])
+        if ious[best] >= HEAD_DET_IOU:
+            p_no_helmets[best].append(nh)
+
+    return p_helmets, p_no_helmets
