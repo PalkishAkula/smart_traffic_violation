@@ -1,0 +1,10 @@
+[
+  {
+    "track_id": 1,
+    "violation_type": "CO_RIDING_NO_HELMET",
+    "plate_text": "MP02AF8345",
+    "plate_conf": 0.4975,
+    "frame_number": 2,
+    "timestamp": 1773070109.993445
+  }
+]

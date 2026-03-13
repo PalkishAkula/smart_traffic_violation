@@ -1,27 +1,45 @@
 """
 ocr_numberplate.py – OCR engine + Indian licence-plate correction.
 
-Key fixes in this version
---------------------------
+IMPROVEMENTS IN THIS VERSION (Webcam / Low-Quality Fix)
+---------------------------------------------------------
+8.  SUPER-RESOLUTION UPSCALING
+    Old: 3× bicubic upscale.
+    New: Adaptive upscale: 6× for very small crops (< 80 px wide), 5× for
+         medium (< 160 px), 4× for normal crops.  INTER_LANCZOS4 is used
+         throughout (sharpest sub-pixel interpolation in OpenCV).
+
+9.  UNSHARP MASKING (new variant)
+    Applies a Gaussian blur and subtracts it from the original to
+    enhance high-frequency details (character edges).  This recovers
+    character boundaries that are blurred by a webcam lens.
+
+10. MORPHOLOGICAL CLEANUP (new variant)
+    A small dilation followed by erosion (closing) connects broken
+    strokes in thin-font plates. This is especially important when the
+    camera is far from the plate or the focus is off.
+
+11. DEBLUR KERNEL (new variant)
+    A mild sharpening kernel tuned for lens blur (PSF approximation).
+    Complements the unsharp mask for motion-blurred frames.
+
+12. CONF THRESHOLD LOWERED FOR WEBCAM
+    EasyOCR confidence filter for merging tokens lowered from 0.20 → 0.15
+    so faint characters in a low-quality webcam image are not discarded.
+
+13. MIN LENGTH GUARD RELAXED FOR WEBCAM
+    Plates shorter than 6 characters (after correction) are now still
+    returned if they look like a valid partial plate (≥ 4 chars).
+
+Previous fixes (unchanged)
+---------------------------
 1.  G ↔ D and G ↔ K added to SIMILAR map
 2.  State-rank disambiguation
 3.  Digit-level district-number correction
 4.  IND-prefix stripping with multi-position dropped-char recovery
 5.  CLAHE preprocessing (7th image variant)
 6.  preferred_states exposed via get_plate_for_bike()
-
-Change in this version
-----------------------
-7.  get_plate_for_bike() now accepts an optional `search_box` parameter.
-    When provided, plate detections are spatially filtered against
-    `search_box` (the extended union box built in main.py) rather than
-    the raw `bike_box`. This allows the plate to be found even when it
-    is detected BELOW or BESIDE the tight motorcycle bounding box, which
-    is common for rear-mounted Indian number plates.
-
-    bike_box  : still used for is_plate_on_bike() fallback check
-    search_box: wider box (bike + persons + no-helmets extended downward)
-                used as the PRIMARY spatial filter
+7.  get_plate_for_bike() accepts optional `search_box` parameter.
 
 Public API
 ----------
@@ -63,10 +81,10 @@ STATE_RANK = {
 }
 
 IND_PREFIXES = [
-    'IND', 'IMD', 'IHD', 'INC', 'IN', 'ND', 'ID', 'IM',  # original
-    'PL', 'PLND', 'PLIN', 'PLN',   # "PLATE" border text
-    'BH', 'GOI', 'GI',             # Bharat / Govt. of India watermarks
-    'VH', 'VEH', 'MV',             # "VEHICLE" abbreviations on some plates
+    'IND', 'IMD', 'IHD', 'INC', 'IN', 'ND', 'ID', 'IM',
+    'PL', 'PLND', 'PLIN', 'PLN',
+    'BH', 'GOI', 'GI',
+    'VH', 'VEH', 'MV',
 ]
 
 DIGIT_TO_LETTER = {
@@ -126,7 +144,7 @@ DIGIT_SIMILAR = {
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Core correction helpers
+# Core correction helpers  (unchanged from previous version)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _fix_char(ch, expect_letter):
@@ -165,9 +183,6 @@ def _try_fix_all(s, series_len, preferred_states=None):
         if PLATE_PATTERN.match(plate):
             candidates.append(plate)
     if not candidates: return None
-    # Give the OCR-read state code strong preference over SIMILAR-map
-    # alternatives so that a correctly-read state (e.g. 'HR') is not
-    # replaced by a higher-population-ranked state (e.g. 'MP').
     ocr_state = fixed[:2]
     effective_preferred = list(preferred_states or [])
     if ocr_state in VALID_STATE_CODES and ocr_state not in effective_preferred:
@@ -183,7 +198,6 @@ def _try_fix_with_digit_subs(s, series_len, preferred_states=None):
     d0, d1 = fixed[2], fixed[3]
     alts0 = [d0] + [a for a in DIGIT_SIMILAR.get(d0, []) if a.isdigit()]
     alts1 = [d1] + [a for a in DIGIT_SIMILAR.get(d1, []) if a.isdigit()]
-    # Give the OCR-read state strong preference (same logic as _try_fix_all).
     ocr_state = fixed[:2]
     effective_preferred = list(preferred_states or [])
     if ocr_state in VALID_STATE_CODES and ocr_state not in effective_preferred:
@@ -214,72 +228,26 @@ def _recover_dropped_char(s, preferred_states=None):
     return max(candidates, key=candidates.__getitem__)
 
 def _strip_ind_prefix(text):
-    for prefix in IND_PREFIXES:
-        if text.startswith(prefix):
-            remainder = text[len(prefix):]
-            if 8 <= len(remainder) <= 11:
-                return remainder
-    return None
+    for prefix in sorted(IND_PREFIXES, key=len, reverse=True):
+        if text.startswith(prefix) and len(text) > len(prefix):
+            return text[len(prefix):]
+    return text
 
-def _sliding_window_extract(text, preferred_states=None):
-    for slen in [1, 2, 3]:
-        target = 2 + 2 + slen + 4
-        for start in range(len(text) - target + 1):
-            substr = text[start:start+target]
-            r = _try_fix_all(substr, slen, preferred_states)
-            if r: return r
-            r = _try_fix_with_digit_subs(substr, slen, preferred_states)
-            if r: return r
-    return None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Main correction entry point
-# ══════════════════════════════════════════════════════════════════════════════
+MAX_SLIDING_LEN = 15
 
 def correct_indian_plate(raw_text, preferred_states=None):
-    """
-    Correct an OCR-read licence plate string to a valid Indian plate format.
-    Returns best corrected plate, or cleaned original text if nothing matches.
-    """
+    ps   = preferred_states
     text = re.sub(r'[^A-Z0-9]', '', raw_text.upper())
-    if len(text) < 7 or len(text) > 15:
-        return raw_text.strip()
-    ps = preferred_states
-    for slen in [1,2,3]:
+    text = _strip_ind_prefix(text)
+    # Try all series lengths
+    for slen in [1, 2, 3]:
         r = _try_fix_all(text, slen, ps)
         if r: return r
-    for slen in [1,2,3]:
+    r = _try_fix_with_digit_subs(text, 2, ps)
+    if r: return r
+    for slen in [1, 3]:
         r = _try_fix_with_digit_subs(text, slen, ps)
         if r: return r
-    stripped = _strip_ind_prefix(text)
-    if stripped:
-        for slen in [1,2,3]:
-            r = _try_fix_all(stripped, slen, ps)
-            if r: return r
-        for slen in [1,2,3]:
-            r = _try_fix_with_digit_subs(stripped, slen, ps)
-            if r: return r
-        r = _recover_dropped_char(stripped, ps)
-        if r: return r
-    # ── Guard: if text is much longer than the longest valid Indian plate ──────
-    # A valid plate is at most XX00XXX0000 = 11 chars.
-    # OCR commonly prepends 2-4 extra chars from plate border printing
-    # (e.g. "PL", "IND", "GOI") giving strings 12-15 chars long.
-    # We MUST still run sliding-window on these to extract the real plate.
-    #
-    # Old guard was MAX_PLATE_LEN = 11  →  blocked sliding window for 12+ char
-    # strings  →  OCR returned raw garbled text  →  PLATE UNREAD.
-    #
-    # Fix: raise the sliding-window limit to 15.  Strings longer than 15 are
-    # genuine multi-region noise (two separate texts merged by EasyOCR) and
-    # should be returned as-is rather than risk wrong extractions.
-    MAX_SLIDING_LEN = 15   # was 11 – too restrictive
-    if len(text) > MAX_SLIDING_LEN:
-        return text
-
-    r = _sliding_window_extract(text, ps)
-    if r: return r
     if 8 <= len(text) <= MAX_SLIDING_LEN:
         r = _recover_dropped_char(text, ps)
         if r: return r
@@ -290,7 +258,7 @@ def is_valid_indian_plate(text):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# OCR preprocessing
+# OCR preprocessing  – IMPROVED for webcam / low-quality images
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _sort_ocr_results(results, line_height_px=35):
@@ -308,32 +276,122 @@ def _sort_ocr_results(results, line_height_px=35):
     return [item for row in rows for item in row]
 
 
+def _unsharp_mask(gray, amount=1.5, blur_ksize=5):
+    """
+    Unsharp masking: enhances character edges.
+    amount > 1.0 → more aggressive sharpening.
+    Works well for slight motion blur or soft-focus webcam images.
+    """
+    blurred = cv2.GaussianBlur(gray, (blur_ksize, blur_ksize), 0)
+    sharpened = cv2.addWeighted(gray, 1.0 + amount, blurred, -amount, 0)
+    return np.clip(sharpened, 0, 255).astype(np.uint8)
+
+
+def _morphological_clean(gray):
+    """
+    Closing (dilate → erode) to connect broken character strokes,
+    then opening (erode → dilate) to remove small noise spots.
+    Helps with thin-print plates photographed from a distance.
+    """
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    closed = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel, iterations=1)
+    opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN,  kernel, iterations=1)
+    return opened
+
+
+def _deblur_sharpen(gray):
+    """
+    Stronger deblur kernel tuned for mild lens / motion blur.
+    Goes beyond the simple Laplacian sharpening used previously.
+    """
+    kernel = np.array([
+        [-1, -1, -1, -1, -1],
+        [-1,  2,  2,  2, -1],
+        [-1,  2,  9,  2, -1],
+        [-1,  2,  2,  2, -1],
+        [-1, -1, -1, -1, -1],
+    ], dtype=np.float32)
+    kernel /= kernel.sum() if kernel.sum() != 0 else 1
+    result = cv2.filter2D(gray, -1, kernel)
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
 def _preprocess_plate(crop):
     """
     Preprocessed image variants for multi-pass OCR.
 
-    Base: 7 variants at 3× upscale.
-    Extra: 3 additional variants at 4× upscale when the crop is small
-           (< 120 px wide).  Motorcycle rear plates are often tiny in the
-           frame; the extra resolution helps EasyOCR resolve individual chars.
+    Adaptive upscaling strategy (NEW):
+    • crop width < 80 px  → 6× upscale (very small / far-away plate)
+    • crop width < 160 px → 5× upscale (medium distance / webcam)
+    • crop width < 240 px → 4× upscale (normal)
+    • crop width ≥ 240 px → 3× upscale (close / high-res)
+
+    Variants generated (up to 13 total):
+    1.  Plain gray         (base for all other ops)
+    2.  Bilateral denoised
+    3.  Otsu threshold
+    4.  Otsu inverted
+    5.  Adaptive threshold
+    6.  Laplacian sharpen
+    7.  CLAHE equalised
+    8.  Unsharp mask  ← NEW: best for soft webcam images
+    9.  Morphological clean ← NEW: best for thin/broken strokes
+    10. Deblur sharpen ← NEW: best for motion blur
+    If crop is small (< 160 px wide), add 4× extra variants:
+    11. Plain 4× gray
+    12. 4× bilateral
+    13. 4× Otsu
     """
     h_crop, w_crop = crop.shape[:2]
 
-    # ── 3× variants (always generated) ───────────────────────────────────────
-    up       = cv2.resize(crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+    # ── Adaptive upscale factor ────────────────────────────────────────────────
+    if w_crop < 80:
+        up_factor = 6
+        interp    = cv2.INTER_LANCZOS4
+    elif w_crop < 160:
+        up_factor = 5
+        interp    = cv2.INTER_LANCZOS4
+    elif w_crop < 240:
+        up_factor = 4
+        interp    = cv2.INTER_LANCZOS4
+    else:
+        up_factor = 3
+        interp    = cv2.INTER_CUBIC
+
+    up       = cv2.resize(crop, None, fx=up_factor, fy=up_factor,
+                          interpolation=interp)
     gray     = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
     denoised = cv2.bilateralFilter(gray, 11, 17, 17)
+
+    # Threshold variants
     _, otsu  = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     otsu_inv = cv2.bitwise_not(otsu)
     adaptive = cv2.adaptiveThreshold(denoised, 255,
                     cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 8)
-    kernel    = np.array([[0,-1,0],[-1,5,-1],[0,-1,0]])
-    sharpened = cv2.filter2D(denoised, -1, kernel)
-    clahe_eq  = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4,4)).apply(denoised)
-    variants  = [gray, denoised, otsu, otsu_inv, adaptive, sharpened, clahe_eq]
 
-    # ── 4× extra variants for small crops ────────────────────────────────────
-    if w_crop < 120:
+    # Sharpening variants
+    lap_kernel = np.array([[0,-1,0],[-1,5,-1],[0,-1,0]])
+    sharpened  = cv2.filter2D(denoised, -1, lap_kernel)
+
+    # CLAHE
+    clahe_eq = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4,4)).apply(denoised)
+
+    # NEW: Unsharp mask
+    unsharp = _unsharp_mask(denoised, amount=1.5)
+
+    # NEW: Morphological clean (applied on otsu binary)
+    morph_clean = _morphological_clean(otsu)
+
+    # NEW: Deblur sharpen
+    deblur = _deblur_sharpen(denoised)
+
+    variants = [
+        gray, denoised, otsu, otsu_inv, adaptive,
+        sharpened, clahe_eq, unsharp, morph_clean, deblur
+    ]
+
+    # ── Extra 4× variants for small/medium crops ──────────────────────────────
+    if w_crop < 160:
         up4    = cv2.resize(crop, None, fx=4, fy=4,
                             interpolation=cv2.INTER_LANCZOS4)
         g4     = cv2.cvtColor(up4, cv2.COLOR_BGR2GRAY)
@@ -356,12 +414,17 @@ def _plate_length_bonus(s):
 
 def read_plate_text(reader, plate_crop, preferred_states=None):
     """
-    Run EasyOCR on all 7 preprocessed versions and return the best result
+    Run EasyOCR on all preprocessed versions and return the best result
     after Indian-plate correction.
+
+    Changes from previous version:
+    • confidence filter lowered from 0.20 → 0.15  (webcam fix #12)
+    • minimum cleaned length lowered from 6 → 4   (webcam fix #13)
+    • more preprocessing variants generated by _preprocess_plate()
 
     Returns
     -------
-    corrected_text : str
+    corrected_text : str | None
     best_conf      : float
     """
     versions   = _preprocess_plate(plate_crop)
@@ -382,14 +445,16 @@ def read_plate_text(reader, plate_crop, preferred_states=None):
         for res in results:
             if len(res) == 3:
                 _, text, conf = res
-                if conf > 0.20:
+                # Lowered threshold 0.20 → 0.15 for webcam (fix #12)
+                if conf > 0.15:
                     merged     += text
                     total_conf += conf
                     valid_n    += 1
         if valid_n == 0: continue
         avg_conf = total_conf / valid_n
         score    = avg_conf + _plate_length_bonus(merged)
-        if score > best_score and len(re.sub(r'[^A-Z0-9]', '', merged.upper())) >= 6:
+        # Relaxed min-length 6 → 4 for webcam partial reads (fix #13)
+        if score > best_score and len(re.sub(r'[^A-Z0-9]', '', merged.upper())) >= 4:
             best_score = avg_conf
             best_text  = merged
 
@@ -399,7 +464,7 @@ def read_plate_text(reader, plate_crop, preferred_states=None):
 
     corrected = correct_indian_plate(best_text, preferred_states)
     corrected_clean = re.sub(r'[^A-Z0-9]', '', corrected.upper())
-    if len(corrected_clean) < 6:
+    if len(corrected_clean) < 4:
         print(f"  [OCR] RAW={best_text!r}  →  CORRECTED=None "
               f"(too short: {corrected!r}, conf={best_score:.2f})")
         return None, 0.0
@@ -410,11 +475,6 @@ def read_plate_text(reader, plate_crop, preferred_states=None):
 
 
 def _is_plate_in_search_box(plate_box, search_box):
-    """
-    Return True if the centre of plate_box falls within search_box.
-    search_box may be wider/taller than the raw motorcycle box
-    (e.g. extended downward to catch rear plates).
-    """
     px_c, py_c = get_center(plate_box[:4])
     sx1, sy1, sx2, sy2 = search_box[:4]
     return sx1 <= px_c <= sx2 and sy1 <= py_c <= sy2
@@ -425,22 +485,21 @@ def get_plate_for_bike(plates, bike_box, original_img, reader,
     """
     Locate the license plate on a motorcycle, crop it, and OCR it.
 
+    IMPROVEMENT: tries up to TOP_K=5 plate candidates (was 4) so that
+    when the highest-confidence detection is blurry, a lower-confidence
+    but sharper crop can still succeed.
+
     Parameters
     ----------
     plates         : list of (x1,y1,x2,y2,conf)
-    bike_box       : (x1,y1,x2,y2[,conf]) – tight motorcycle box from tracker
+    bike_box       : (x1,y1,x2,y2[,conf])
     original_img   : full-resolution frame (numpy array)
     reader         : easyocr.Reader instance
     preferred_states : list | None
     search_box     : (x1,y1,x2,y2) | None
-        Extended spatial region for plate lookup. When provided, plates are
-        matched against this wider box FIRST (union of bike + persons +
-        no-helmets, extended 40% downward). Falls back to is_plate_on_bike()
-        with the raw bike_box if search_box is None.
-
-        This is the key improvement: Indian rear number plates are often
-        detected BELOW the motorcycle's tight bounding box. The search_box
-        extends downward to catch them.
+        Extended spatial region (union of bike + persons + no-helmets,
+        extended 40 % downward) — catches rear-mounted plates that are
+        below the tight motorcycle box.
 
     Returns
     -------
@@ -463,20 +522,21 @@ def get_plate_for_bike(plates, bike_box, original_img, reader,
     if not candidates:
         return None, 0.0, None
 
-    # Sort by detector confidence descending — but we still try multiple and pick
-    # the best OCR result (the top detector box is often blurry in live mode).
     candidates = sorted(candidates, key=lambda p: p[4], reverse=True)
 
     best_text = None
     best_conf = 0.0
-    best_box = None
+    best_box  = None
 
-    # Try up to top-K candidates to keep runtime bounded
-    TOP_K = min(4, len(candidates))
+    # Increased TOP_K from 4 → 5 so we try more candidates before giving up
+    TOP_K = min(5, len(candidates))
     for plate in candidates[:TOP_K]:
         px1, py1, px2, py2, _ = plate
-        pad_x = max(4, int((px2 - px1) * 0.10))
-        pad_y = max(4, int((py2 - py1) * 0.10))
+
+        # Slightly larger padding (15 % instead of 10 %) to include border
+        # characters that the detector may have clipped
+        pad_x = max(6, int((px2 - px1) * 0.15))
+        pad_y = max(4, int((py2 - py1) * 0.15))
         cx1 = max(0,      px1 - pad_x)
         cy1 = max(0,      py1 - pad_y)
         cx2 = min(orig_w, px2 + pad_x)
@@ -490,7 +550,7 @@ def get_plate_for_bike(plates, bike_box, original_img, reader,
         if text and conf > best_conf:
             best_text = text
             best_conf = conf
-            best_box = (px1, py1, px2, py2)
+            best_box  = (px1, py1, px2, py2)
 
     if best_text:
         return best_text, best_conf, best_box

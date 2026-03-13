@@ -1,0 +1,20 @@
+[
+  {
+    "track_id": 1,
+    "violation_type": "TRIPLE_RIDING",
+    "plate_text": "HR02AF8345",
+    "plate_conf": 0.9773,
+    "frame_number": 3,
+    "plate_retries": 0,
+    "timestamp": 1773067405.3663144
+  },
+  {
+    "track_id": 1,
+    "violation_type": "CO_RIDING_NO_HELMET",
+    "plate_text": "HR02AF8345",
+    "plate_conf": 0.9773,
+    "frame_number": 3,
+    "plate_retries": 0,
+    "timestamp": 1773067419.798658
+  }
+]

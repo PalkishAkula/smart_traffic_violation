@@ -1,0 +1,10 @@
+[
+  {
+    "track_id": 1,
+    "violation_type": "NO_HELMET",
+    "plate_text": "HR02AF8345",
+    "plate_conf": 0.8933,
+    "frame_number": 2,
+    "timestamp": 1773069287.162478
+  }
+]
