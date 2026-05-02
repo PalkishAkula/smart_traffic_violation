@@ -17,3 +17,6 @@ build/
 
 .DS_Store
 Thumbs.db
+
+# Prevent accidental nested bare repository dumps
+repo.git/
