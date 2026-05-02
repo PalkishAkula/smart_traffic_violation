@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import { Upload as UploadIcon, CheckCircle, AlertCircle } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import api, { API_BASE } from "../services/api";
+import api from "../services/api";
 import ViolationTable from "../components/ViolationTable";
 import EvidenceModal from "../components/EvidenceModal";
 
@@ -17,25 +17,18 @@ export default function Upload() {
   const [currentFrame, setCurrentFrame] = useState(0);
   const [totalFrames, setTotalFrames] = useState(0);
   const [currentFps, setCurrentFps] = useState(0);
-  const [logLines, setLogLines] = useState([]);
   const [violations, setViolations] = useState([]);
   const [error, setError] = useState(null);
   const [selectedViolation, setSelectedViolation] = useState(null);
   const fileInput = useRef(null);
-  const logRef = useRef(null);
-
-  // Auto-scroll log panel to bottom
-  useEffect(() => {
-    if (logRef.current) {
-      logRef.current.scrollTop = logRef.current.scrollHeight;
-    }
-  }, [logLines]);
 
   // ── Robust polling ────────────────────────────────────────────────────────
   useEffect(() => {
     if (!jobId) return;
 
-    const interval = setInterval(async () => {
+    let intervalId = null;
+
+    const pollStatus = async () => {
       try {
         const res = await api.get(`/api/upload/status/${jobId}`);
         const data = res.data;
@@ -46,25 +39,28 @@ export default function Upload() {
           setCurrentFrame(data.current_frame);
         if (data.total_frames !== undefined) setTotalFrames(data.total_frames);
         if (data.current_fps !== undefined) setCurrentFps(data.current_fps);
-        if (data.log_lines) setLogLines(data.log_lines);
 
         if (data.status === "done") {
-          clearInterval(interval);
+          if (intervalId) clearInterval(intervalId);
           setJobStatus("done");
           setProgressPct(100);
           setViolations(data.violations ?? []);
           return;
         }
 
-        if (data.status === "error") {
-          clearInterval(interval);
+        if (data.status === "error" || data.status === "failed") {
+          if (intervalId) clearInterval(intervalId);
           setJobStatus("error");
-          setError(data.error || "Processing failed. Check server logs.");
+          setError(
+            data.error ||
+              data.error_message ||
+              "Processing failed. Check server logs.",
+          );
           return;
         }
 
         if (data.status === "not_found") {
-          clearInterval(interval);
+          if (intervalId) clearInterval(intervalId);
           setJobStatus("error");
           setError("Job not found on server.");
           return;
@@ -73,16 +69,20 @@ export default function Upload() {
         // status === 'processing' → keep polling
         setJobStatus("processing");
       } catch (networkErr) {
-        clearInterval(interval);
+        if (intervalId) clearInterval(intervalId);
         setJobStatus("error");
         setError("Could not reach server. Is the backend running?");
       }
-    }, 2000);
+    };
+
+    // Fetch immediately so UI starts at 0% instead of waiting for first interval tick.
+    pollStatus();
+    intervalId = setInterval(pollStatus, 2000);
 
     // Hard safety timeout: 15 minutes
     const timeout = setTimeout(
       () => {
-        clearInterval(interval);
+        if (intervalId) clearInterval(intervalId);
         setJobStatus((prev) => {
           if (prev === "processing") {
             setError("Processing timed out after 15 minutes.");
@@ -95,7 +95,7 @@ export default function Upload() {
     );
 
     return () => {
-      clearInterval(interval);
+      if (intervalId) clearInterval(intervalId);
       clearTimeout(timeout);
     };
   }, [jobId]);
@@ -119,13 +119,15 @@ export default function Upload() {
     try {
       const res = await api.post("/api/upload/video", formData, {
         onUploadProgress: (e) => {
-          setUploadProgress(Math.round((e.loaded / e.total) * 100));
+          const total = e.total || file.size || 0;
+          if (total > 0) {
+            setUploadProgress(Math.round((e.loaded / total) * 100));
+          }
         },
       });
       setJobId(res.data.job_id);
       setJobStatus("processing");
       setProgressPct(0);
-      setLogLines([]);
     } catch (err) {
       setError(err.response?.data?.detail || "Upload failed");
     } finally {
@@ -143,7 +145,6 @@ export default function Upload() {
     setCurrentFrame(0);
     setTotalFrames(0);
     setCurrentFps(0);
-    setLogLines([]);
     setError(null);
   };
 
@@ -174,20 +175,6 @@ export default function Upload() {
           showCamera={false}
           onViewEvidence={setSelectedViolation}
         />
-
-        {/* Model Logs (collapsed by default) */}
-        {logLines.length > 0 && (
-          <details className="bg-white border border-gray-200 rounded-2xl overflow-hidden">
-            <summary className="px-5 py-3 text-sm font-semibold text-gray-700 cursor-pointer hover:bg-gray-50">
-              {t("Model Logs")} ({logLines.length} {t("lines")})
-            </summary>
-            <div className="bg-gray-900 p-4 max-h-64 overflow-y-auto font-mono text-xs text-green-400 leading-relaxed">
-              {logLines.map((line, i) => (
-                <div key={i}>{line}</div>
-              ))}
-            </div>
-          </details>
-        )}
 
         {selectedViolation && (
           <EvidenceModal
@@ -259,18 +246,6 @@ export default function Upload() {
               {progressPct.toFixed(1)}%
             </p>
           </div>
-
-          {/* Live model logs */}
-          {logLines.length > 0 && (
-            <div
-              ref={logRef}
-              className="bg-gray-900 rounded-xl p-4 max-h-48 overflow-y-auto font-mono text-xs text-green-400 leading-relaxed"
-            >
-              {logLines.map((line, i) => (
-                <div key={i}>{line}</div>
-              ))}
-            </div>
-          )}
         </div>
       </div>
     );

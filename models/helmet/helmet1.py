@@ -19,7 +19,7 @@ model = YOLO("yolov8n.pt")   # Upgraded from yolov8n
 model.train(
     data=DATA_YAML,
     epochs=40,              # Increased epochs
-    imgsz=768,              # Larger image size (better small object detection)
+    imgsz=640,              # Larger image size (better small object detection)
     batch=16,
     device=device,
     workers=4,

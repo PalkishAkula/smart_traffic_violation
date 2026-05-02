@@ -1,0 +1,22 @@
+YOLO Metrics From best.pt (No Retraining)
+============================================
+
+[HELMET MODEL]
+Path: D:\Final year project\user interface\models\helmet\best.pt
+Exists: True
+Train Metrics:
+  Precision : 0.91317
+  Recall    : 0.88954
+  mAP50     : 0.94579
+  mAP50-95  : 0.68315
+  Fitness   : 0.68315
+
+[LICENSE MODEL]
+Path: D:\Final year project\user interface\models\license\best.pt
+Exists: True
+Train Metrics:
+  Precision : 0.99061
+  Recall    : 0.97581
+  mAP50     : 0.98723
+  mAP50-95  : 0.88486
+  Fitness   : 0.88486

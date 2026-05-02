@@ -7,82 +7,54 @@ Two responsibilities:
   2. ViolationMemory – deduplication store, one record per (track_id, vtype)
                        with built-in OCR retry support for UNDETECTED plates.
 
+CHANGES IN THIS VERSION
+-----------------------
+1.  KalmanTrack._id_counter is a CLASS variable — it persists between
+    pipeline runs in the same process.  When run_pipeline() or
+    run_pipeline_live() is called a second time (e.g. web server processing
+    a second video), track IDs continue from where the last run left off.
+    This means ViolationMemory deduplication (which keys on track_id) still
+    works, but track IDs in the JSON report become confusingly large.
+
+    Fix: SOTTracker.reset() now calls KalmanTrack.reset_counter() to bring
+    the counter back to 0.  The counter is still a class variable (so all
+    KalmanTrack instances share the same sequence within one run), but it is
+    explicitly zeroed at the start of each pipeline run via SOTTracker.reset().
+
+2.  SOTTracker.__init__() now calls self.reset() so a freshly constructed
+    tracker always starts with counter=0 and an empty track list — even if
+    a previous instance left the counter at a large value.
+
 ═══════════════════════════════════════════════════════════════════
   SORT vs DeepSORT – Algorithm Choice & Justification
 ═══════════════════════════════════════════════════════════════════
 
-  SORT (Simple Online and Realtime Tracking)  ← THIS PROJECT USES SORT
-  ─────────────────────────────────────────
-  Algorithm:
-    1. Kalman filter predicts each track's position in the current frame.
-    2. IoU cost matrix is built between predicted boxes and new detections.
-    3. Hungarian algorithm finds the globally optimal assignment.
-    4. Unmatched detections → new tracks. Stale tracks → pruned.
-
-  Pros:
-    • Extremely fast: < 1 ms per frame on CPU (vs 150–200 ms for DeepSORT).
-    • No external model weights required.
-    • Stable for fixed-camera scenes with clear line-of-sight.
-    • Sufficient accuracy when objects don't occlude each other long-term.
-
-  Cons:
-    • No appearance model → may swap IDs when two bikes cross paths.
-    • Cannot re-identify a bike that was fully occluded for many frames.
-
-  ─────────────────────────────────────────────────────────────────
-  DeepSORT
-  ─────────────────────────────────────────────────────────────────
-  Algorithm:
-    SORT + a ReID CNN that extracts a 128-dimensional appearance
-    embedding from each detected crop. Embeddings are compared using
-    cosine distance alongside IoU in the assignment step. A gallery
-    of past embeddings per track enables re-identification after long
-    occlusions.
-
-  Pros:
-    • Much better re-identification after full occlusion.
-    • More robust when multiple bikes cross paths simultaneously.
-    • ID switches are significantly reduced.
-
-  Cons:
-    • ReID CNN forward pass: ~150–200 ms per frame ON CPU per crop.
-    • Requires a pre-trained ReID model (additional dependency).
-    • On CPU this would drop our pipeline from ~6 FPS to ~1–2 FPS.
-
-  ─────────────────────────────────────────────────────────────────
-  WHY SORT IS THE CORRECT CHOICE FOR THIS PROJECT
-  ─────────────────────────────────────────────────────────────────
-  1. FIXED CAMERA:  The traffic camera is stationary. Motorcycles move
-     through the scene in predictable trajectories. Full long-term
-     occlusion (the case DeepSORT excels at) almost never occurs.
-
-  2. CPU-ONLY HARDWARE:  The pipeline already runs 3× YOLO models per
-     processed frame. Adding a ReID CNN would add 150–200 ms per frame,
-     reducing throughput to < 2 FPS — making the system unusable.
-
-  3. FRAME SKIPPING:  We process only every Nth frame. DeepSORT's
-     appearance gallery would become stale under frame skipping,
-     degrading its main advantage further.
-
-  4. VIOLATION SEMANTICS:  A brief ID swap causes at worst a duplicate
-     violation entry (which ViolationMemory suppresses) — not a missed
-     violation. SORT's occasional ID swap is acceptable here.
-
-  CONCLUSION:  SORT is the correct engineering trade-off for this
-  fixed-camera, CPU-only, frame-skipping pipeline. DeepSORT would hurt
-  more than it helps here.
-
-  If a GPU is added in future, replace only SOTTracker.update() with a
-  DeepSORT call; all other modules remain unchanged.
+  SORT is used here.  See previous version's comments for full
+  algorithm comparison.  Summary: SORT is the correct trade-off
+  for a fixed-camera, CPU-only, frame-skipping pipeline.
 
 Reference: Bewley et al. 2016 "Simple Online and Realtime Tracking"
 """
 
+import itertools
+import re
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Tuple, List
 import time
+
+# Thread-safe monotonic counter for unique ViolationRecord IDs.
+# itertools.count is safe under CPython's GIL; each __next__() is atomic.
+_rec_id_counter = itertools.count(1)
+
+_EVENT_PLATE_PATTERN = re.compile(r'^[A-Z]{2}\d{2}[A-Z]{1,3}\d{4}$')
+
+
+def _plate_rank(plate_text: str | None, plate_conf: float) -> tuple:
+    """Rank OCR results for one bike event: full valid plate beats partial text."""
+    text = plate_text or ""
+    return (1 if _EVENT_PLATE_PATTERN.match(text) else 0, float(plate_conf))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -151,6 +123,17 @@ class KalmanTrack:
         self._x[:4]      = _ltrb_to_z(ltrb)
         self._last_ltrb  = ltrb.copy()
 
+    @classmethod
+    def reset_counter(cls):
+        """
+        Reset the global track ID counter to 0.
+
+        Call this at the start of each pipeline run (via SOTTracker.reset())
+        so that track IDs in JSON reports always start from 1, regardless of
+        how many previous pipeline runs have been executed in the same process.
+        """
+        cls._id_counter = 0
+
     def predict(self):
         """Kalman predict — call EVERY frame including skipped ones."""
         if self.age > 0:
@@ -197,6 +180,9 @@ class SOTTracker:
         self.max_age    = max_age
         self.iou_thresh = iou_thresh
         self._tracks: List[KalmanTrack] = []
+        # Reset the ID counter whenever a new tracker is created so that
+        # each pipeline run starts track IDs from 1.
+        KalmanTrack.reset_counter()
 
     def predict_all(self):
         """
@@ -215,19 +201,9 @@ class SOTTracker:
         If two detections overlap by more than `iou_thresh`, the lower-
         confidence one is suppressed. This stops a single motorcycle from
         spawning two Kalman tracks when YOLO fires two overlapping boxes.
-
-        Parameters
-        ----------
-        detections : list of ([x1,y1,x2,y2], conf)
-        iou_thresh : IoU above which the weaker box is suppressed (default 0.45)
-
-        Returns
-        -------
-        Filtered list, ordered by descending confidence.
         """
         if len(detections) <= 1:
             return detections
-        # Sort by confidence descending
         dets = sorted(detections, key=lambda d: d[1], reverse=True)
         keep = []
         suppressed = set()
@@ -257,10 +233,6 @@ class SOTTracker:
         -------
         Confirmed tracks (hits >= 2).
         """
-        # ── Suppress duplicate detections for the same physical object ────────
-        # If YOLO fires two overlapping boxes for the same motorcycle
-        # (IoU > 0.45), keep only the higher-confidence one. This prevents
-        # the tracker from spawning two separate tracks for one bike.
         detections = self._nms_detections(detections, iou_thresh=0.45)
         if not detections:
             self._tracks = [t for t in self._tracks if t.age <= self.max_age]
@@ -301,8 +273,13 @@ class SOTTracker:
         return self.associate(detections)
 
     def reset(self):
+        """
+        Clear all active tracks and reset the ID counter.
+
+        Call this between pipeline runs to start track IDs from 1 again.
+        """
         self._tracks.clear()
-        KalmanTrack._id_counter = 0
+        KalmanTrack.reset_counter()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -313,6 +290,13 @@ class SOTTracker:
 class ViolationRecord:
     """
     Stores one confirmed violation event.
+
+    record_id : int
+        Globally unique ID assigned at construction via a monotonic counter.
+        Used by ViolationMemory.get_by_id() so that OCR futures can update
+        the EXACT record they were submitted for, even if the memory store
+        was invalidated and a new record was created at the same (track_id,
+        violation_type) key (track-reuse scenario).
 
     plate_retries : int
         Number of times OCR has been retried after an initial UNDETECTED
@@ -326,8 +310,9 @@ class ViolationRecord:
     frame_number:   int
     timestamp:      float = field(default_factory=time.time)
     evidence_path:  Optional[str] = None
-    plate_retries:        int = 0    # how many OCR retries have been attempted
-    plate_last_retry_frame: int = -9999  # real frame number of last retry attempt
+    plate_retries:        int = 0
+    plate_last_retry_frame: int = -9999
+    record_id:      int   = field(default_factory=lambda: next(_rec_id_counter))
 
     def __str__(self):
         plate = self.plate_text or "UNDETECTED"
@@ -344,56 +329,71 @@ class ViolationMemory:
     """
     One record per (track_id, violation_type) — prevents duplicates.
 
-    Extended in this version with OCR retry support:
+    Extended with OCR retry support:
       needs_plate_retry() – True if plate was UNDETECTED and retries remain.
       update_plate()      – Overwrites plate_text after a successful retry.
+
+    OCR RECORD-PINNING
+    ------------------
+    When a track ID is reused (new physical bike matched to old track), the
+    old violation record is removed from _store but kept in _all_records.
+    OCR futures carry the record_id of the record they were submitted for.
+    _harvest_ocr calls get_by_id(record_id) to update the EXACT record,
+    ensuring Honda OCR → Honda record and Royal Enfield OCR → RE record,
+    even when both share the same (track_id, violation_type) key.
     """
 
-    MAX_PLATE_RETRIES = 20  # max retry attempts before giving up
-                            # (spaced by PLATE_RETRY_FRAME_GAP in main.py, so
-                            #  this covers a long window regardless of N)
+    MAX_PLATE_RETRIES = 20
 
     def __init__(self):
         self._store: Dict[Tuple[int, str], ViolationRecord] = {}
+        # All records ever added (including removed ones) keyed by record_id.
+        # This lets OCR callbacks find the right record even after removal.
+        self._all_records: Dict[int, ViolationRecord] = {}
 
     def has(self, track_id: int, vtype: str) -> bool:
         return (track_id, vtype) in self._store
 
-    def is_duplicate_plate(self, plate_text: str | None, vtype: str,
-                           frame_window: int = 30) -> bool:
+    def is_duplicate_plate(self, track_id: int, plate_text: str | None,
+                           vtype: str) -> bool:
         """
-        Return True if an existing record already has the same plate_text
-        (non-None) and violation_type within `frame_window` frames.
-
-        This prevents the same physical motorcycle — assigned two Track IDs
-        by the SORT tracker — from generating two separate violation records.
-
-        Parameters
-        ----------
-        plate_text   : OCR result to check (None is never considered duplicate)
-        vtype        : violation type string
-        frame_window : records within this many frames are checked (default 30)
+        Return True if an existing record for the SAME track_id already has
+        the same plate_text (non-None) and violation_type.
         """
         if not plate_text:
-            return False   # can't deduplicate without a plate
+            return False
         for rec in self._store.values():
-            if (rec.violation_type == vtype
-                    and rec.plate_text == plate_text):
+            if (rec.track_id      == track_id
+                    and rec.violation_type == vtype
+                    and rec.plate_text     == plate_text):
                 return True
         return False
 
     def add(self, record: ViolationRecord):
-        # Reject if same plate + same violation type already logged
-        if self.is_duplicate_plate(record.plate_text, record.violation_type):
+        if self.is_duplicate_plate(record.track_id,
+                                   record.plate_text,
+                                   record.violation_type):
             print(f"  [DEDUP] Skipped duplicate: "
                   f"plate={record.plate_text} type={record.violation_type} "
                   f"track={record.track_id}")
             return
         self._store[(record.track_id, record.violation_type)] = record
+        self._all_records[record.record_id] = record   # ← always keep by ID
         print(record)
 
     def get(self, track_id: int, vtype: str) -> Optional[ViolationRecord]:
         return self._store.get((track_id, vtype))
+
+    def get_by_id(self, record_id: int) -> Optional[ViolationRecord]:
+        """
+        Return the ViolationRecord with this exact record_id regardless of
+        whether it is still in _store (it may have been removed by
+        invalidate_single_rider_violations during track reuse).
+
+        Used by _harvest_ocr to pin OCR results to the specific record
+        that submitted the OCR task.
+        """
+        return self._all_records.get(record_id)
 
     def all_records(self) -> List[ViolationRecord]:
         return list(self._store.values())
@@ -403,18 +403,6 @@ class ViolationMemory:
     def needs_plate_retry(self, track_id: int, vtype: str,
                           frame_num: int = 0,
                           retry_frame_gap: int = 1) -> bool:
-        """
-        Return True if this violation was logged with UNDETECTED plate,
-        has not exhausted its retry budget, AND enough real frames have
-        passed since the last retry attempt.
-
-        Parameters
-        ----------
-        frame_num       : current frame number (real video frame counter)
-        retry_frame_gap : minimum real frames between consecutive retries.
-                          Keeping this constant makes retry behaviour the
-                          same regardless of PROCESS_EVERY_N_FRAMES.
-        """
         rec = self._store.get((track_id, vtype))
         if rec is None:
             return False
@@ -425,24 +413,123 @@ class ViolationMemory:
         return (frame_num - rec.plate_last_retry_frame) >= retry_frame_gap
 
     def increment_retry(self, track_id: int, vtype: str, frame_num: int = 0):
-        """Mark one more retry attempt and record the frame it happened on."""
         rec = self._store.get((track_id, vtype))
         if rec is not None:
-            rec.plate_retries           += 1
+            rec.plate_retries          += 1
             rec.plate_last_retry_frame  = frame_num
+
+    def remove(self, track_id: int, vtype: str):
+        """
+        Remove a record from the active _store but KEEP it in _all_records.
+
+        Any in-flight OCR future that was submitted for this record carries
+        its record_id.  When OCR completes, _harvest_ocr calls
+        get_by_id(record_id) which finds the record in _all_records and
+        updates plate_text on the correct instance — this patches the DB
+        entry for the original (Honda) bike even though its memory entry
+        has been cleared to make room for the new (Royal Enfield) bike.
+        """
+        key = (track_id, vtype)
+        if key in self._store:
+            # Leave in _all_records so OCR callbacks can still resolve it
+            del self._store[key]
+            print(f"  [MEM REMOVE] Track-{track_id:03d} {vtype} cleared "
+                  f"(track reuse / rider-count change detected)")
+
+    def invalidate_single_rider_violations(self, track_id: int):
+        """
+        When TRIPLE_RIDING is newly detected on a track that previously had
+        only single-rider violations, the SORT tracker has almost certainly
+        re-assigned the track ID to a different physical motorcycle.
+
+        Remove stale single-rider records (NO_HELMET) for this track so they
+        can be freshly logged with the plate of the new bike.
+
+        CO_RIDING_NO_HELMET and TRIPLE_RIDING records are left untouched —
+        they will be logged normally by _log() after this call.
+        """
+        for vtype in ('NO_HELMET',):
+            self.remove(track_id, vtype)
 
     def update_plate(self, track_id: int, vtype: str,
                      plate_text: str, plate_conf: float):
-        """
-        Overwrite the plate on an existing record after a successful retry.
-        Prints a confirmation line to the terminal.
-        """
         rec = self._store.get((track_id, vtype))
         if rec is not None:
             rec.plate_text  = plate_text
             rec.plate_conf  = plate_conf
             print(f"  [PLATE RETRY ✓] Track-{track_id:03d} "
                   f"{vtype} → {plate_text} (conf={plate_conf:.2f})")
+
+    def propagate_plate_from_record(self, record_id: int,
+                                    plate_text: str,
+                                    plate_conf: float) -> List[ViolationRecord]:
+        """
+        Share one successful OCR result with sibling violations from the same
+        bike event (same track_id and frame_number).
+
+        Only unresolved records are updated, so an existing stronger read is
+        never overwritten.
+        """
+        src = self._all_records.get(record_id)
+        if src is None:
+            return []
+
+        updated: List[ViolationRecord] = []
+        for rec in self._store.values():
+            if rec.track_id != src.track_id or rec.frame_number != src.frame_number:
+                continue
+            if rec.record_id != src.record_id and rec.plate_text not in (None, "UNDETECTED"):
+                continue
+            rec.plate_text = plate_text
+            rec.plate_conf = plate_conf
+            updated.append(rec)
+        return updated
+
+    def event_records(self, record_id: int) -> List[ViolationRecord]:
+        """Return active violation records from the same tracked bike event."""
+        src = self._all_records.get(record_id)
+        if src is None:
+            return []
+        return [
+            rec for rec in self._store.values()
+            if rec.track_id == src.track_id and rec.frame_number == src.frame_number
+        ]
+
+    def apply_event_plate_result(self, record_id: int,
+                                 plate_text: str,
+                                 plate_conf: float) -> tuple:
+        """
+        Apply an OCR result to every violation from the same bike event.
+
+        A later higher-quality result can replace an earlier weaker one. This
+        keeps TRIPLE / CO_RIDING / NO_HELMET records consistent while still
+        letting the best OCR read win.
+        """
+        records = self.event_records(record_id)
+        if not records:
+            return [], None, False
+
+        existing = [
+            rec for rec in records
+            if rec.plate_text not in (None, "UNDETECTED")
+        ]
+        previous_plate = None
+        if existing:
+            best_existing = max(
+                existing,
+                key=lambda rec: _plate_rank(rec.plate_text, rec.plate_conf),
+            )
+            previous_plate = (best_existing.plate_text, best_existing.plate_conf)
+            candidate_rank = _plate_rank(plate_text, plate_conf)
+            existing_rank = _plate_rank(best_existing.plate_text, best_existing.plate_conf)
+            if candidate_rank < existing_rank:
+                return [], previous_plate, False
+
+        for rec in records:
+            rec.plate_text = plate_text
+            rec.plate_conf = plate_conf
+
+        return records, previous_plate, True
 
     # ── Summary ───────────────────────────────────────────────────────────────
 

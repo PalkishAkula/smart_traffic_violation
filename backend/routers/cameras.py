@@ -3,6 +3,7 @@ routers/cameras.py – Camera CRUD + start/stop live detection.
 """
 
 from datetime import datetime, timezone
+import asyncio
 
 from fastapi import APIRouter, HTTPException, Depends
 
@@ -65,7 +66,7 @@ async def delete_camera(camera_id: str, user=Depends(get_current_user)):
 
     # Stop if running
     if camera_manager and camera_manager.status(camera_id) == "running":
-        camera_manager.stop(camera_id)
+        await asyncio.to_thread(camera_manager.stop, camera_id)
 
     await cameras_collection.delete_one({
         "camera_id": camera_id,
@@ -106,7 +107,7 @@ async def stop_camera(camera_id: str, user=Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="Camera not found")
 
     if camera_manager:
-        camera_manager.stop(camera_id)
+        await asyncio.to_thread(camera_manager.stop, camera_id)
 
     await cameras_collection.update_one(
         {"camera_id": camera_id, "user_id": str(user["_id"])},

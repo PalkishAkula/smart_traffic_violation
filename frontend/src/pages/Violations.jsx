@@ -7,6 +7,7 @@ import { useTranslation } from "react-i18next";
 import useViolationStore from "../store/violationStore";
 
 import useCameraStore from "../store/cameraStore";
+import socket, { connectSocket } from "../services/socket";
 
 import ViolationTable from "../components/ViolationTable";
 
@@ -14,6 +15,8 @@ import EvidenceModal from "../components/EvidenceModal";
 
 export default function Violations() {
   const { t } = useTranslation();
+  const getViolationId = (v) => v?.id || v?._id;
+  const getPlateValue = (v) => v?.plate_number ?? v?.plate_text ?? null;
 
   const {
     violations,
@@ -42,12 +45,86 @@ export default function Violations() {
   const [deleteError, setDeleteError] = useState(null);
 
   const [searchTimeout, setSearchTimeout] = useState(null);
+  const [displayViolations, setDisplayViolations] = useState([]);
+
+  const normalizeViolation = useCallback(
+    (violation) => {
+      const id = getViolationId(violation);
+      const plateValue = getPlateValue(violation);
+      return {
+        ...violation,
+        ...(id ? { id } : {}),
+        plate_number: plateValue,
+        plate_text: plateValue,
+      };
+    },
+    [],
+  );
 
   useEffect(() => {
     fetchViolations();
 
     fetchCameras();
   }, [page]);
+
+  useEffect(() => {
+    setDisplayViolations(violations.map(normalizeViolation));
+  }, [violations, normalizeViolation]);
+
+  useEffect(() => {
+    connectSocket();
+
+    const patchViolation = (id, updates) => {
+      if (!id) return;
+
+      setDisplayViolations((prev) =>
+        prev.map((violation) =>
+          getViolationId(violation) === id
+            ? normalizeViolation({ ...violation, ...updates, id })
+            : violation,
+        ),
+      );
+
+      setSelectedViolation((prev) =>
+        prev && getViolationId(prev) === id
+          ? normalizeViolation({ ...prev, ...updates, id })
+          : prev,
+      );
+
+      setDeleteTarget((prev) =>
+        prev && getViolationId(prev) === id
+          ? normalizeViolation({ ...prev, ...updates, id })
+          : prev,
+      );
+    };
+
+    const handleViolationNew = (data) => {
+      const incoming = normalizeViolation(data);
+      const incomingId = getViolationId(incoming);
+      if (!incomingId) return;
+
+      setDisplayViolations((prev) => [
+        incoming,
+        ...prev.filter((violation) => getViolationId(violation) !== incomingId),
+      ]);
+    };
+
+    const handlePlateUpdate = (data) => {
+      patchViolation(data?.id, {
+        plate_number: data?.plate_number,
+        plate_text: data?.plate_text ?? data?.plate_number,
+        plate_conf: data?.plate_conf ?? 0.0,
+      });
+    };
+
+    socket.on("violation_new", handleViolationNew);
+    socket.on("violation_plate_update", handlePlateUpdate);
+
+    return () => {
+      socket.off("violation_new", handleViolationNew);
+      socket.off("violation_plate_update", handlePlateUpdate);
+    };
+  }, [normalizeViolation]);
 
   // Refetch when filters change (except plate_text which is debounced)
 
@@ -71,8 +148,6 @@ export default function Violations() {
       }, 400),
     );
   };
-
-  const getViolationId = (v) => v?.id || v?._id;
 
   const handleDelete = async (violation) => {
     setDeleteError(null);
@@ -111,12 +186,12 @@ export default function Violations() {
       "Detected At",
     ];
 
-    const rows = violations.map((v) => [
+    const rows = displayViolations.map((v) => [
       v.camera_id,
 
       v.violation_type,
 
-      v.plate_text || "UNDETECTED",
+      getPlateValue(v) || "UNDETECTED",
 
       v.plate_conf ? `${(v.plate_conf * 100).toFixed(1)}%` : "",
 
@@ -240,7 +315,7 @@ export default function Violations() {
       {/* Table */}
 
       <ViolationTable
-        violations={violations}
+        violations={displayViolations}
         onViewEvidence={setSelectedViolation}
         onDelete={handleDelete}
       />
@@ -348,7 +423,7 @@ export default function Violations() {
                 <div className="flex justify-between gap-4">
                   <span className="text-gray-400">{t("Plate")}</span>
                   <span className="font-mono font-medium">
-                    {deleteTarget.plate_text || "UNDETECTED"}
+                    {getPlateValue(deleteTarget) || "UNDETECTED"}
                   </span>
                 </div>
               </div>

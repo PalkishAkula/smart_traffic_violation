@@ -1,0 +1,7 @@
+path: D:/Final year project/project/dataset/license_plate
+train: train/images
+val: valid/images
+test: test/images
+
+nc: 1
+names: [License_Plate]

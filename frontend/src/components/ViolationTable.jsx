@@ -25,6 +25,8 @@ export default function ViolationTable({
   showCamera = true,
 }) {
   const { t } = useTranslation();
+  const getPlateValue = (violation) =>
+    violation?.plate_number ?? violation?.plate_text ?? null;
 
   const formatDate = (iso) => {
     if (!iso) return "—";
@@ -135,9 +137,13 @@ export default function ViolationTable({
                   </td>
 
                   <td className="px-5 py-3 text-sm">
-                    {v.plate_text ? (
+                    {getPlateValue(v) === "PROCESSING" ? (
+                      <span className="inline-flex items-center rounded-full bg-gray-100 px-2.5 py-1 text-xs font-medium text-gray-500 animate-pulse">
+                        Reading plate...
+                      </span>
+                    ) : getPlateValue(v) && getPlateValue(v) !== "UNDETECTED" ? (
                       <span className="font-mono font-medium text-gray-900">
-                        {v.plate_text}
+                        {getPlateValue(v)}
                       </span>
                     ) : (
                       <span className="text-gray-400 italic text-xs">

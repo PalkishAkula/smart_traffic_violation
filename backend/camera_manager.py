@@ -11,7 +11,9 @@ import asyncio
 import time
 import sys
 import os
+import importlib
 from typing import Dict, Callable, Optional
+import concurrent.futures
 
 # Add ML pipeline to path
 ML_PIPELINE_DIR = os.path.abspath(
@@ -25,15 +27,36 @@ class CameraManager:
     """
     Manages one background thread per active camera.
     """
-    def __init__(self, violation_handler: Callable, frame_handler: Callable,
+    def __init__(self, violation_handler: Callable, plate_resolved_handler: Callable,
+                 frame_handler: Callable,
                  loop: asyncio.AbstractEventLoop,
                  status_callback: Callable = None):
         self._threads: Dict[str, threading.Thread] = {}
         self._stop_events: Dict[str, threading.Event] = {}
         self._violation_handler = violation_handler
+        self._plate_resolved_handler = plate_resolved_handler
         self._frame_handler = frame_handler
         self._loop = loop
         self._status_callback = status_callback  # async fn(camera_id, status)
+
+    def _submit_async(self, coro, label: str, wait: bool = False, timeout: float = 10.0):
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        if wait:
+            try:
+                future.result(timeout=timeout)
+            except concurrent.futures.TimeoutError:
+                print(f"[CameraManager] Timed out waiting for {label}")
+            except Exception as exc:
+                print(f"[CameraManager] {label} failed: {exc}")
+        else:
+            def _log_failure(done_future):
+                try:
+                    done_future.result()
+                except Exception as exc:
+                    print(f"[CameraManager] {label} failed: {exc}")
+
+            future.add_done_callback(_log_failure)
+        return future
 
     def start(self, camera_id: str, source: str):
         """Start live detection for a camera."""
@@ -47,28 +70,35 @@ class CameraManager:
         self._stop_events[camera_id] = stop_event
 
         def violation_cb(rec, jpeg):
-            asyncio.run_coroutine_threadsafe(
+            self._submit_async(
                 self._violation_handler(camera_id, rec, jpeg),
-                self._loop
+                f"violation_handler[{camera_id}]",
             )
 
         def frame_cb(jpeg):
-            asyncio.run_coroutine_threadsafe(
+            self._submit_async(
                 self._frame_handler(camera_id, jpeg),
-                self._loop
+                f"frame_handler[{camera_id}]",
+            )
+
+        def plate_resolved_cb(rec):
+            self._submit_async(
+                self._plate_resolved_handler(camera_id, rec),
+                f"plate_resolved_handler[{camera_id}]",
+                wait=False,
             )
 
         def on_thread_exit(cam_id, status):
             """Called when camera thread exits — update status."""
             if self._status_callback:
-                asyncio.run_coroutine_threadsafe(
+                self._submit_async(
                     self._status_callback(cam_id, status),
-                    self._loop
+                    f"status_callback[{cam_id}]",
                 )
 
         t = threading.Thread(
             target=self._run_camera,
-            args=(src, camera_id, stop_event, violation_cb, frame_cb, on_thread_exit),
+            args=(src, camera_id, stop_event, violation_cb, plate_resolved_cb, frame_cb, on_thread_exit),
             daemon=True,
             name=f"cam-{camera_id}",
         )
@@ -76,19 +106,20 @@ class CameraManager:
         t.start()
         print(f"[CameraManager] Started thread for camera {camera_id} (source={src})")
 
-    def _run_camera(self, source, camera_id, stop_event, violation_cb, frame_cb, on_exit):
+    def _run_camera(self, source, camera_id, stop_event, violation_cb, plate_resolved_cb, frame_cb, on_exit):
         """Run the live pipeline in a background thread."""
         exit_status = "stopped"
         try:
-            from main import run_pipeline_live
+            run_pipeline_live = importlib.import_module("main").run_pipeline_live
             from model_registry import models
             print(f"[CameraManager] Using run_pipeline_live for {camera_id}")
             run_pipeline_live(
-                source,
-                camera_id,
-                stop_event,
-                violation_cb,
-                frame_cb,
+                camera_source=source,
+                camera_id=camera_id,
+                stop_event=stop_event,
+                violation_callback=violation_cb,
+                plate_resolved_callback=plate_resolved_cb,
+                frame_callback=frame_cb,
                 model_registry=models,
             )
         except ImportError:
@@ -144,9 +175,13 @@ class CameraManager:
         if camera_id in self._stop_events:
             self._stop_events[camera_id].set()
         if camera_id in self._threads:
-            self._threads[camera_id].join(timeout=5)
+            t = self._threads[camera_id]
+            t.join(timeout=8)
+            if t.is_alive():
+                print(f"[CameraManager] stop timeout for {camera_id}; thread still alive")
+                return
             del self._threads[camera_id]
-            del self._stop_events[camera_id]
+            self._stop_events.pop(camera_id, None)
 
     def status(self, camera_id: str) -> str:
         t = self._threads.get(camera_id)

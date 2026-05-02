@@ -1,0 +1,51 @@
+{
+  "source": "checkpoint train_metrics/train_results embedded in best.pt",
+  "note": "No dataset validation or retraining executed.",
+  "helmet": {
+    "model_path": "D:\\Final year project\\user interface\\models\\helmet\\best.pt",
+    "exists": true,
+    "classes": {
+      "0": "bike",
+      "1": "helmet",
+      "2": "no-helmet",
+      "3": "number-plate"
+    },
+    "checkpoint_epoch_field": -1,
+    "checkpoint_best_fitness_field": null,
+    "train_metrics": {
+      "precision": 0.91317,
+      "recall": 0.88954,
+      "mAP50": 0.94579,
+      "mAP50_95": 0.68315,
+      "fitness": 0.68315
+    },
+    "last_epoch_metrics_from_train_results": {
+      "precision": 0.91317,
+      "recall": 0.88954,
+      "mAP50": 0.94579,
+      "mAP50_95": 0.68315
+    }
+  },
+  "license": {
+    "model_path": "D:\\Final year project\\user interface\\models\\license\\best.pt",
+    "exists": true,
+    "classes": {
+      "0": "number_plate"
+    },
+    "checkpoint_epoch_field": -1,
+    "checkpoint_best_fitness_field": null,
+    "train_metrics": {
+      "precision": 0.99061,
+      "recall": 0.97581,
+      "mAP50": 0.98723,
+      "mAP50_95": 0.88486,
+      "fitness": 0.88486
+    },
+    "last_epoch_metrics_from_train_results": {
+      "precision": 0.99099,
+      "recall": 0.97581,
+      "mAP50": 0.98707,
+      "mAP50_95": 0.87704
+    }
+  }
+}

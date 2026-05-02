@@ -81,10 +81,11 @@ export default function Cameras() {
   const handleDelete = async (cameraId) => {
     if (!confirm(`${t("Delete camera")} ${cameraId}?`)) return;
     try {
-      unsubscribeCamera(cameraId);
       await deleteCamera(cameraId);
+      unsubscribeCamera(cameraId);
     } catch (err) {
-      alert(t("Failed to delete camera"));
+      console.error("Delete camera error:", err);
+      alert(err.response?.data?.detail || t("Failed to delete camera"));
     }
   };
 

@@ -13,6 +13,7 @@ import re
 import threading
 import time
 import io
+import importlib
 from datetime import datetime, timezone
 
 import pymongo
@@ -29,9 +30,11 @@ ML_PIPELINE_DIR = os.path.abspath(
 )
 
 # Regex to parse progress lines like:
-# "  Frame 00060/192  [31.2%]  14.8 FPS  |  ..."
+# "  Frame 00060/192  [31.2%]  14.8 fps  |  ..."
+# Case-insensitive so both "fps" and "FPS" work.
 PROGRESS_RE = re.compile(
-    r"Frame\s+(\d+)/(\d+)\s+\[(\d+\.?\d*)%\]\s+(\d+\.?\d*)\s+FPS"
+    r"Frame\s+(\d+)/(\d+)\s+\[(\d+\.?\d*)%\]\s+(\d+\.?\d*)\s+fps",
+    re.IGNORECASE,
 )
 
 
@@ -134,7 +137,7 @@ def _run_pipeline_thread(job_id: str, video_path: str,
         sys.stdout = capture
 
         # Import and run the pipeline
-        from main import run_pipeline
+        run_pipeline = importlib.import_module("main").run_pipeline
 
         memory = run_pipeline(
             video_path=video_path,

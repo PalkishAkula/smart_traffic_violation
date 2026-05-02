@@ -7,6 +7,7 @@ import Home from "./pages/Home";
 import Dashboard from "./pages/Dashboard";
 import Cameras from "./pages/Cameras";
 import Upload from "./pages/Upload";
+import ImageTest from "./pages/ImageTest";
 import Violations from "./pages/Violations";
 import Instructions from "./pages/Instructions";
 import socket, { connectSocket } from "./services/socket";
@@ -179,6 +180,28 @@ export default function App() {
             </ProtectedRoute>
           }
         />
+        <Route
+          path="/image-test"
+          element={
+            <ProtectedRoute>
+              <AppLayout toasts={toasts} dismissToast={dismissToast}>
+                <ImageTest />
+              </AppLayout>
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/image-test/*"
+          element={
+            <ProtectedRoute>
+              <AppLayout toasts={toasts} dismissToast={dismissToast}>
+                <ImageTest />
+              </AppLayout>
+            </ProtectedRoute>
+          }
+        />
+        <Route path="/image_test" element={<Navigate to="/image-test" replace />} />
+        <Route path="/imagetest" element={<Navigate to="/image-test" replace />} />
         <Route
           path="/instructions"
           element={
